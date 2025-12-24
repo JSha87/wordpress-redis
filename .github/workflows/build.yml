@@ -33,5 +33,5 @@ jobs:
         context: .
         push: true
         tags: |
-          ghcr.io/${{ github.repository_owner }}/wordpress-redis:latest
-          ghcr.io/${{ github.repository_owner }}/wordpress-redis:8.3
+          ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:latest
+          ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:8.3
