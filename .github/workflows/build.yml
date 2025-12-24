@@ -35,3 +35,4 @@ jobs:
         tags: |
           ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:latest
           ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:8.3
+
