@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  packages: write   # REQUIRED for GHCR
+  packages: write
 
 jobs:
   build:
@@ -16,6 +16,9 @@ jobs:
     steps:
     - name: Checkout repo
       uses: actions/checkout@v4
+
+    - name: Set lowercase owner
+      run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -33,6 +36,5 @@ jobs:
         context: .
         push: true
         tags: |
-          ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:latest
-          ghcr.io/${{ github.repository_owner | toLower }}/wordpress-redis:8.3
-
+          ghcr.io/${{ env.OWNER_LC }}/wordpress-redis:latest
+          ghcr.io/${{ env.OWNER_LC }}/wordpress-redis:8.3
