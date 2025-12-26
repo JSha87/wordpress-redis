@@ -3,9 +3,6 @@ name: Build & Push WordPress Redis Image
 on:
   push:
     branches: ["main"]
-    paths:
-      - Dockerfile
-      - staging/Dockerfile
   workflow_dispatch:
 
 permissions:
@@ -21,7 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dorny/paths-filter@v3
+      - name: Detect changed Dockerfiles
+        uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -46,7 +44,7 @@ jobs:
             tag: staging
 
     steps:
-      - name: Skip if not enabled
+      - name: Skip if no changes
         if: matrix.enabled != 'true'
         run: exit 0
 
