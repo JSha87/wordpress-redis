@@ -1,0 +1,67 @@
+# Use official PHP-FPM image instead of Apache-based WordPress
+FROM php:8.3-fpm-alpine
+
+# Install system dependencies
+RUN apk add --no-cache \
+    freetype-dev \
+    libjpeg-turbo-dev \
+    libpng-dev \
+    libzip-dev \
+    icu-dev \
+    oniguruma-dev \
+    wget \
+    unzip
+
+# Install PHP extensions
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) \
+        gd \
+        mysqli \
+        pdo_mysql \
+        zip \
+        intl \
+        opcache \
+        exif
+
+# Install Redis and igbinary extensions
+RUN apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
+    && pecl install redis igbinary \
+    && docker-php-ext-enable redis igbinary \
+    && apk del .build-deps
+
+# Download and extract WordPress
+ENV WORDPRESS_VERSION=6.7.1
+RUN wget https://wordpress.org/wordpress-${WORDPRESS_VERSION}.tar.gz \
+    && tar -xzf wordpress-${WORDPRESS_VERSION}.tar.gz -C /var/www/html --strip-components=1 \
+    && rm wordpress-${WORDPRESS_VERSION}.tar.gz
+
+# PHP configuration for performance
+RUN { \
+    echo 'opcache.enable=1'; \
+    echo 'opcache.memory_consumption=256'; \
+    echo 'opcache.interned_strings_buffer=16'; \
+    echo 'opcache.max_accelerated_files=10000'; \
+    echo 'opcache.revalidate_freq=2'; \
+    echo 'opcache.fast_shutdown=1'; \
+    echo 'upload_max_filesize=64M'; \
+    echo 'post_max_size=64M'; \
+    echo 'memory_limit=512M'; \
+    echo 'max_execution_time=300'; \
+} > /usr/local/etc/php/conf.d/custom.ini
+
+# PHP-FPM configuration to listen on TCP (for container networking)
+RUN sed -i 's/listen = .*/listen = 9000/' /usr/local/etc/php-fpm.d/www.conf \
+    && sed -i 's/;listen.owner/listen.owner/' /usr/local/etc/php-fpm.d/www.conf \
+    && sed -i 's/;listen.group/listen.group/' /usr/local/etc/php-fpm.d/www.conf
+
+# Set proper permissions (matches your securityContext runAsUser: 1000)
+RUN chown -R 1000:1000 /var/www/html
+
+WORKDIR /var/www/html
+
+EXPOSE 9000
+
+# Run as non-root user
+USER 1000
+
+CMD ["php-fpm"]
