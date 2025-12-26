@@ -16,12 +16,17 @@ jobs:
       build_root: ${{ steps.filter.outputs.root }}
       build_staging: ${{ steps.filter.outputs.staging }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo (FULL HISTORY REQUIRED)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Detect changed Dockerfiles
-        uses: dorny/paths-filter@v3
         id: filter
+        uses: dorny/paths-filter@v3
         with:
+          base: ${{ github.event.before }}
+          ref: ${{ github.sha }}
           filters: |
             root:
               - Dockerfile
@@ -29,7 +34,6 @@ jobs:
             staging:
               - staging/Dockerfile
               - staging/dockerfile
-
 
   build:
     needs: detect
@@ -47,7 +51,7 @@ jobs:
             tag: staging
 
     steps:
-      - name: Skip if no changes
+      - name: Skip if not enabled
         if: matrix.enabled != 'true'
         run: exit 0
 
