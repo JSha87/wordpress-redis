@@ -1,5 +1,4 @@
 # Use official PHP-FPM image instead of Apache-based WordPress
-#FUUUUUCK
 FROM php:8.3-fpm-alpine
 
 # Install system dependencies
