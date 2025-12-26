@@ -1,6 +1,6 @@
 # Use official PHP-FPM image instead of Apache-based WordPress
 FROM php:8.3-fpm-alpine
-
+#test
 # Install system dependencies
 RUN apk add --no-cache \
     freetype-dev \
