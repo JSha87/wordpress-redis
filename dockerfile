@@ -1,42 +1,39 @@
-FROM wordpress:php8.3-apache
+FROM nextcloud:32.0.3-fpm-alpine
 
-# Install dependencies including zstd for Redis compression
-RUN apt-get update && apt-get install -y \
+# 1. Install build dependencies for the missing modules
+# We use 'apk add' for system libs and 'docker-php-ext-install' for the PHP glue
+RUN apk add --no-cache \
     libzip-dev \
-    zlib1g-dev \
-    libzstd-dev \
-    libzstd1 \
-    zstd \
-    git \
+    libpng-dev \
+    libjpeg-turbo-dev \
+    libwebp-dev \
+    freetype-dev \
+    icu-dev \
     autoconf \
-    make \
-    && rm -rf /var/lib/apt/lists/*
+    g++ \
+    make
 
-# Install igbinary for better Redis serialization
-RUN pecl install igbinary \
-    && docker-php-ext-enable igbinary
+# 2. Explicitly install/configure the modules Nextcloud is complaining about
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp && \
+    docker-php-ext-install -j$(nproc) \
+    gd \
+    zip \
+    pdo_mysql \
+    intl \
+    bcmath
 
-# Install zstd PHP extension for compression support
-RUN pecl install zstd \
-    && docker-php-ext-enable zstd
+# 3. Install APCu (for memory caching) via PECL
+RUN pecl install apcu && \
+    docker-php-ext-enable apcu
 
-# Install phpredis with igbinary and zstd support
-RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
-    && cd /tmp/phpredis \
-    && phpize \
-    && ./configure --enable-redis-zstd --enable-redis-igbinary \
-    && make -j$(nproc) \
-    && make install \
-    && docker-php-ext-enable redis \
-    && rm -rf /tmp/phpredis
+# 4. Bake the code into the image (Immutable)
+RUN cp -at /var/www/html /usr/src/nextcloud/
 
-# Copy WordPress core from /usr/src/wordpress to /var/www/html at BUILD time
-RUN cp -rp /usr/src/wordpress/. /var/www/html/
+# 5. Set the restrictive permissions we discussed
+RUN mkdir -p /var/www/html/data /var/www/html/config /var/www/html/custom_apps && \
+    chown -R 1003:1003 /var/www/html/data \
+                       /var/www/html/config \
+                       /var/www/html/custom_apps \
+                       /usr/local/etc/php/conf.d
 
-# Set proper ownership (we'll run as uid 1300 in Kubernetes)
-RUN chown -R 1300:1300 /var/www/html
-
-# Override the entrypoint to skip the file copying logic
-# We want to go straight to starting Apache
-ENTRYPOINT []
-CMD ["apache2-foreground"]
+USER 1003
