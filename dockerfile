@@ -33,8 +33,8 @@ RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
 # Copy WordPress core from /usr/src/wordpress to /var/www/html at BUILD time
 RUN cp -rp /usr/src/wordpress/. /var/www/html/
 
-# Set proper ownership (we'll run as uid 1300 in Kubernetes)
-RUN chown -R 1300:1300 /var/www/html
+# Set proper ownership (we'll run as uid 1000 in Kubernetes)
+RUN chown -R 1000:1000 /var/www/html
 
 # Override the entrypoint to skip the file copying logic
 # We want to go straight to starting Apache
