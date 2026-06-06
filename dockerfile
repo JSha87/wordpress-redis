@@ -1,6 +1,6 @@
 FROM wordpress:php8.3-apache
 
-# Install dependencies including zstd for Redis compression
+# Install dependencies including zstd for Redis compression #update
 RUN apt-get update && apt-get install -y \
     libzip-dev \
     zlib1g-dev \
