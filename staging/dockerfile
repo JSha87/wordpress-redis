@@ -38,9 +38,10 @@ COPY --from=build /usr/local/lib/php /usr/local/lib/php
 RUN chown -R 1000:1000 /var/www/html
 
 # Create a non-root user and switch to it
-RUN useradd --home-dir=/nonexistent --shell=/bin/sh www-data && \
-    addgroup www-data www-data && \
-    chown -R www-data:www-data /var/www/html
+RUN if ! id -u www-data > /dev/null 2>&1; then \
+    useradd --home-dir=/nonexistent --shell=/bin/sh www-data; \
+    addgroup www-data www-data; \
+fi && chown -R www-data:www-data /var/www/html
 
 USER www-data
 
