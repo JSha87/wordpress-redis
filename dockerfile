@@ -33,7 +33,8 @@ FROM wordpress:php8.3-apache
 # Copy build artifacts from previous stage
 COPY --from=build /usr/local/etc/php /usr/local/etc/php
 COPY --from=build /usr/local/lib/php /usr/local/lib/php
-# The extension should be available via the full copy of /usr/local/lib/php if enabled correctly.
+COPY --from=build /usr/local/bin/phpredis.so /usr/local/lib/php/extensions/no-debug-non-zts-20230219/
+
 # Set proper ownership for files used at build time
 RUN chown -R 1000:1000 /var/www/html
 
