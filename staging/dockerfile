@@ -1,71 +1,56 @@
-# Use official PHP-FPM Alpine image
-FROM php:8.3-fpm-alpine
+# Use official Wordpress image with PHP 8.3 and Apache as base
+FROM wordpress:php8.3-apache AS build
 
-# Install system dependencies
-RUN apk add --no-cache \
-    freetype-dev \
-    libjpeg-turbo-dev \
-    libpng-dev \
+# Install dependencies including zstd for Redis compression
+RUN apt-get update && apt-get install -y \
     libzip-dev \
-    icu-dev \
-    oniguruma-dev \
-    wget \
-    unzip
+    zlib1g-dev \
+    libzstd-dev \
+    libzstd1 \
+    zstd \
+    git \
+    autoconf \
+    make \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install PHP extensions
-RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j$(nproc) \
-        gd \
-        mysqli \
-        pdo_mysql \
-        zip \
-        intl \
-        opcache \
-        exif
+# Install PECL extensions
+RUN pecl install igbinary zstd \
+    && docker-php-ext-enable igbinary zstd
 
-# Install Redis and igbinary extensions
-RUN apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
-    && pecl install redis igbinary \
-    && docker-php-ext-enable redis igbinary \
-    && apk del .build-deps \
-    && rm -rf /tmp/pear
+# Build phpredis with igbinary and zstd support
+RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
+    && cd /tmp/phpredis \
+    && phpize \
+    && ./configure --enable-redis-zstd --enable-redis-igbinary \
+    && make -j$(nproc) \
+    && make install \
+    && docker-php-ext-enable redis \
+    && rm -rf /tmp/phpredis
 
-# Download latest WordPress
-RUN wget https://wordpress.org/latest.tar.gz \
-    && tar -xzf latest.tar.gz -C /var/www/html --strip-components=1 \
-    && rm latest.tar.gz
+# Final stage
+FROM wordpress:php8.3-apache
 
-# PHP performance optimizations
-RUN { \
-    echo 'opcache.enable=1'; \
-    echo 'opcache.memory_consumption=256'; \
-    echo 'opcache.interned_strings_buffer=16'; \
-    echo 'opcache.max_accelerated_files=10000'; \
-    echo 'opcache.revalidate_freq=2'; \
-    echo 'opcache.fast_shutdown=1'; \
-    echo 'upload_max_filesize=64M'; \
-    echo 'post_max_size=64M'; \
-    echo 'memory_limit=512M'; \
-    echo 'max_execution_time=300'; \
-} > /usr/local/etc/php/conf.d/custom.ini
+# Copy build artifacts from previous stage
+COPY --from=build /usr/local/etc/php /usr/local/etc/php
+COPY --from=build /usr/local/lib/php /usr/local/lib/php
+COPY --from=build /usr/local/bin/phpredis.so /usr/local/lib/php/extensions/no-debug-non-zts-20230219/
 
-# Configure PHP-FPM
-RUN sed -i 's/listen = .*/listen = 9000/' /usr/local/etc/php-fpm.d/www.conf
+# Set proper ownership for files used at build time
+RUN chown -R 1000:1000 /var/www/html
 
-# Set ownership of WordPress core to root (immutable)
-RUN chown -R root:root /var/www/html
+# Create a non-root user and switch to it
+RUN useradd --home-dir=/nonexistent --shell=/bin/sh www-data && \
+    addgroup www-data www-data && \
+    chown -R www-data:www-data /var/www/html
 
-# Create wp-content directory that will be mounted as volume
-RUN mkdir -p /var/www/html/wp-content/uploads \
-             /var/www/html/wp-content/plugins \
-             /var/www/html/wp-content/themes \
-    && chown -R 1000:1000 /var/www/html/wp-content
+USER www-data
 
-WORKDIR /var/www/html
+# Copy WordPress core from /usr/src/wordpress to /var/www/html at BUILD time
+RUN cp -rp /usr/src/wordpress/. /var/www/html/
 
-EXPOSE 9000
+# Add a health check mechanism
+HEALTHCHECK CMD curl --fail http://localhost || exit 1
 
-# Run as non-root user
-USER 1000
-
-CMD ["php-fpm"]
+# Override the entrypoint to skip file copying logic and go straight to Apache
+ENTRYPOINT ["docker-php-entrypoint"]
+CMD ["apache2-foreground"]
