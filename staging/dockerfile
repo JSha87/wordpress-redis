@@ -1,7 +1,8 @@
-# Use official Wordpress image with PHP 8.3 and Apache as base
+# ============================================================================
+# STAGE 1: build PHP extensions (unchanged from before, discarded after)
+# ============================================================================
 FROM wordpress:php8.3-apache AS build
 
-# Install dependencies including zstd for Redis compression
 RUN apt-get update && apt-get install -y \
     libzip-dev \
     zlib1g-dev \
@@ -13,11 +14,9 @@ RUN apt-get update && apt-get install -y \
     make \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PECL extensions
 RUN pecl install igbinary zstd \
     && docker-php-ext-enable igbinary zstd
 
-# Build phpredis with igbinary and zstd support
 RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
     && cd /tmp/phpredis \
     && phpize \
@@ -27,30 +26,56 @@ RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
     && docker-php-ext-enable redis \
     && rm -rf /tmp/phpredis
 
-# Final stage
+
+# ============================================================================
+# STAGE 2: final runtime image
+# ============================================================================
 FROM wordpress:php8.3-apache
 
-# Copy build artifacts from previous stage
 COPY --from=build /usr/local/etc/php /usr/local/etc/php
 COPY --from=build /usr/local/lib/php /usr/local/lib/php
 
-# Set proper ownership for files used at build time
-RUN chown -R 1000:1000 /var/www/html
+# Create UID/GID 1300 to match k3s's runAsUser/fsGroup: 1300.
+# --shell=/sbin/nologin: service account only, never an interactive login.
+RUN groupadd -g 1300 wpuser \
+    && useradd -u 1300 -g 1300 --home-dir=/nonexistent --shell=/sbin/nologin wpuser
 
-# Create a non-root user and switch to it
-RUN if ! id -u www-data > /dev/null 2>&1; then \
-    useradd --home-dir=/nonexistent --shell=/bin/sh www-data; \
-    addgroup www-data www-data; \
-fi && chown -R www-data:www-data /var/www/html
-
-USER www-data
-
-# Copy WordPress core from /usr/src/wordpress to /var/www/html at BUILD time
+# Lay down WordPress core into the webroot.
 RUN cp -rp /usr/src/wordpress/. /var/www/html/
 
-# Add a health check mechanism
+# --- Immutable core ---
+# Own everything under webroot as root, dirs 755 / files 644. Any non-root
+# UID (including 1300) can read/execute but cannot write, rename, or delete.
+# This is the actual immutability mechanism — it's a filesystem permission,
+# not the USER directive.
+RUN chown -R root:root /var/www/html \
+    && find /var/www/html -type d -exec chmod 755 {} \; \
+    && find /var/www/html -type f -exec chmod 644 {} \;
+
+# --- wp-content is intentionally NOT chowned/chmodded here ---
+# Your k3s manifest mounts a PVC directly over /var/www/html/wp-content:
+#   volumeMounts:
+#   - mountPath: /var/www/html/wp-content
+#     name: wordpress-data
+# That PVC mount completely replaces this directory's contents at container
+# start — whatever ownership/permissions we set on it in the image are
+# irrelevant, since the NFS share (already owned by 1300 on the QNAP side)
+# is what actually gets mounted there. Setting permissions on it here would
+# be dead code that only matters in the hypothetical case someone runs this
+# image without the PVC mounted (e.g. local `docker run` testing) — if you
+# want that fallback case to also be writable by 1300, uncomment:
+#
+# RUN mkdir -p /var/www/html/wp-content \
+#     && chown -R 1300:1300 /var/www/html/wp-content \
+#     && find /var/www/html/wp-content -type d -exec chmod 775 {} \; \
+#     && find /var/www/html/wp-content -type f -exec chmod 664 {} \;
+
+# Run as the same UID your k3s manifest enforces via runAsUser: 1300.
+# This also matters for local `docker run` testing so behavior matches
+# what the cluster will actually do.
+USER 1300
+
 HEALTHCHECK CMD curl --fail http://localhost || exit 1
 
-# Override the entrypoint to skip file copying logic and go straight to Apache
 ENTRYPOINT ["docker-php-entrypoint"]
 CMD ["apache2-foreground"]
