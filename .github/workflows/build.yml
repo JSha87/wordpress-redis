@@ -3,15 +3,70 @@ name: Build & Push WordPress Redis Image
 on:
   push:
     branches: ["main"]
+  schedule:
+    # Check daily at 06:00 UTC for a new wordpress:php8.3-apache release.
+    # This job is cheap (one API call) and only triggers a real rebuild
+    # if the upstream digest actually changed.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # needed so record-digest can commit the new upstream digest marker
   packages: write
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  UPSTREAM_IMAGE: wordpress:php8.3-apache
+
 jobs:
+  # ==========================================================================
+  # Ask Docker Hub what the current digest of wordpress:php8.3-apache is,
+  # and compare it against the digest we last built against (tracked in
+  # .github/upstream-digest.txt in this repo). Runs on every trigger —
+  # push, schedule, and manual dispatch — since it's cheap and this is
+  # the single source of truth for "did upstream ship something new".
+  # ==========================================================================
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Get current upstream digest
+        id: digest
+        run: |
+          DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_IMAGE}" --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "Upstream digest: $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against last known digest
+        id: compare
+        run: |
+          LAST=""
+          if [ -f .github/upstream-digest.txt ]; then
+            LAST=$(cat .github/upstream-digest.txt)
+          fi
+          if [ "$LAST" != "${{ steps.digest.outputs.digest }}" ]; then
+            echo "New upstream image detected: $LAST -> ${{ steps.digest.outputs.digest }}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No upstream change since last build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ==========================================================================
+  # Only meaningful on push events — detects whether the Dockerfiles
+  # themselves were edited, so a manual change to staging/Dockerfile
+  # doesn't also trigger a root rebuild and vice versa. Skipped entirely
+  # on schedule/workflow_dispatch, where check-upstream is the trigger
+  # of interest instead.
+  # ==========================================================================
   detect:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       build_root: ${{ steps.filter.outputs.root }}
@@ -20,7 +75,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Detect changed Dockerfiles
         id: filter
         uses: dorny/paths-filter@v4
@@ -35,15 +89,30 @@ jobs:
               - staging/Dockerfile
               - staging/dockerfile
 
+  # ==========================================================================
+  # Build the root (production) image if EITHER the Dockerfile changed
+  # (push) OR upstream shipped a new wordpress:php8.3-apache (schedule).
+  # `always()` is required because `detect` is skipped on non-push events —
+  # without it, this job would be skipped too since one of its needs didn't
+  # succeed. A skipped job's outputs are just empty strings, so the
+  # build_root check below correctly evaluates false in that case.
+  # ==========================================================================
   build-root:
-    needs: detect
-    if: needs.detect.outputs.build_root == 'true'
+    needs: [detect, check-upstream]
+    if: always() && (needs.detect.outputs.build_root == 'true' || needs.check-upstream.outputs.changed == 'true')
     runs-on: ubuntu-latest
+    outputs:
+      tag_version: ${{ steps.meta.outputs.tag_version }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set lowercase owner
         run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
+      - name: Compute build metadata
+        id: meta
+        run: |
+          echo "tag_version=wp-$(date +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -58,27 +127,33 @@ jobs:
         with:
           context: .
           push: true
+          # Pin the exact upstream digest this build used, so the image
+          # is fully reproducible regardless of what wordpress:php8.3-apache
+          # points to later.
+          build-args: |
+            BASE_IMAGE=wordpress@${{ needs.check-upstream.outputs.digest }}
           tags: |
             ghcr.io/${{ env.OWNER_LC }}/wordpress-redis:latest
+            ghcr.io/${{ env.OWNER_LC }}/wordpress-redis:${{ steps.meta.outputs.tag_version }}
 
+  # ==========================================================================
+  # Same logic for staging — only rebuilds staging/Dockerfile changes, not
+  # driven by the upstream digest check (staging tracks manual edits only).
+  # ==========================================================================
   build-staging:
     needs: detect
     if: needs.detect.outputs.build_staging == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Set lowercase owner
         run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
-
       - uses: docker/setup-buildx-action@v4
-
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build and push staging image
         uses: docker/build-push-action@v6
         with:
@@ -86,3 +161,28 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.OWNER_LC }}/wordpress-redis:staging
+
+  # ==========================================================================
+  # After a successful upstream-triggered rebuild, record the new digest
+  # so tomorrow's scheduled check has something correct to compare against.
+  # Only runs when the rebuild was actually caused by an upstream change —
+  # a plain push that edits the Dockerfile shouldn't touch this marker.
+  # ==========================================================================
+  record-digest:
+    needs: [check-upstream, build-root]
+    if: needs.check-upstream.outputs.changed == 'true' && needs.build-root.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Record new upstream digest
+        run: |
+          mkdir -p .github
+          echo "${{ needs.check-upstream.outputs.digest }}" > .github/upstream-digest.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/upstream-digest.txt
+          git commit -m "chore: record upstream ${{ env.UPSTREAM_IMAGE }} digest ${{ needs.check-upstream.outputs.digest }}" || echo "Nothing to commit"
+          git push
