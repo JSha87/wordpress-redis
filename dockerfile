@@ -1,4 +1,5 @@
 # Use official Wordpress image with PHP 8.3 and Apache as base
+# CRITICAL SECURITY UPDATE TO VERSION 7.0.2
 FROM wordpress:php8.3-apache AS build
 
 # Install dependencies including zstd for Redis compression
