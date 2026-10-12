@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # WordPress + Redis (igbinary/zstd) — immutable core image
 # ==========================================================================
 # Design:
