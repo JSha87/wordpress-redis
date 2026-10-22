@@ -5,8 +5,10 @@
 #   - Core (wp-admin, wp-includes, top-level *.php) is owned by root and
 #     read-only to the runtime user.
 #   - Runtime user is a non-root UID/GID set by build args (default 1300) to
-#     match your orchestrator's securityContext. Apache listens on an
-#     unprivileged port (default 8080) so no capabilities are needed.
+#     match your orchestrator's securityContext. Apache listens on port 80 by
+#     default (fine where unprivileged low ports are allowed, e.g. current
+#     k3s). On platforms that forbid that, build with --build-arg WP_PORT=8080.
+#     The bind address is a runtime env var (WP_LISTEN), no rebuild needed.
 #   - wp-content is writable by the runtime user only (plugins/themes/uploads).
 #     PHP execution inside wp-content/uploads is denied.
 #   - No compilers or PECL/PEAR tooling in the final image; no setuid binaries.
@@ -14,7 +16,10 @@
 #     rules live in the server config, so nothing needs to write to the webroot.
 #
 # Runtime requirements:
-#   - Container port is 8080 (not 80). Update Service/targetPort/-p mappings.
+#   - Port defaults to 80. To accept connections only from inside the pod
+#     (e.g. an in-pod auth proxy fronts WordPress), set env
+#     WP_LISTEN=127.0.0.1:80. Use an exec probe (curl 127.0.0.1) in that case,
+#     because httpGet probes hit the pod IP and would fail.
 #   - Recommended securityContext: runAsNonRoot, allowPrivilegeEscalation=false,
 #     capabilities.drop=[ALL], seccompProfile=RuntimeDefault. The root FS can be
 #     read-only if you mount writable emptyDirs at /tmp, /var/run/apache2,
@@ -26,7 +31,7 @@
 
 ARG WP_UID=1300
 ARG WP_GID=1300
-ARG WP_PORT=8080
+ARG WP_PORT=80
 
 # Floating tag by default for local builds. CI should pin to a digest
 # (wordpress@sha256:...). Both stages MUST use the same base.
@@ -37,30 +42,56 @@ ARG BASE_IMAGE=wordpress:php8.5-apache
 # ============================================================================
 FROM ${BASE_IMAGE} AS build
 
-# Exact, reviewed versions (verified current as of 2026-10-21).
-# Bump deliberately; do not use floating "latest" for compiled code.
+# Exact, reviewed versions (verified current as of 2026-10-21). Each one is
+# built from its upstream git tag, and the tag's commit is verified, so builds
+# are reproducible and tamper-evident. PECL is deliberately not used: it is
+# deprecated upstream and its infrastructure has had outages.
+#   igbinary 3.2.17RC1: the only release with explicit PHP 8.5 support.
+#   zstd 0.18.0:        latest stable.
+#   phpredis 6.3.0:     latest stable.
+ARG IGBINARY_VERSION=3.2.17RC1
+ARG IGBINARY_COMMIT=edda710
+ARG ZSTD_EXT_VERSION=0.18.0
+ARG ZSTD_EXT_COMMIT=c2593a4
 ARG PHPREDIS_VERSION=6.3.0
 ARG PHPREDIS_COMMIT=df4fab2
-ARG IGBINARY_VERSION=3.2.16
-ARG ZSTD_EXT_VERSION=0.16.0
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+        $PHPIZE_DEPS \
         ca-certificates \
         git \
-        libzstd-dev \
-        pkg-config; \
+        libzstd-dev; \
     rm -rf /var/lib/apt/lists/*
 
-# igbinary + zstd from PECL at pinned versions (system libzstd requested).
+# igbinary first: phpredis needs its headers (installed by `make install`).
 RUN set -eux; \
-    pecl install "igbinary-${IGBINARY_VERSION}"; \
-    pecl install -D 'with-libzstd="yes"' "zstd-${ZSTD_EXT_VERSION}"; \
-    docker-php-ext-enable igbinary zstd
+    git clone --depth=1 --branch "${IGBINARY_VERSION}" \
+        https://github.com/igbinary/igbinary.git /tmp/igbinary; \
+    cd /tmp/igbinary; \
+    git rev-parse HEAD | grep -q "^${IGBINARY_COMMIT}"; \
+    phpize; \
+    ./configure; \
+    make -j"$(nproc)"; \
+    make install; \
+    docker-php-ext-enable igbinary; \
+    cd /; rm -rf /tmp/igbinary
 
-# phpredis built from a pinned tag (not the default branch), with the tag's
-# commit verified, so the build is reproducible and tamper-evident.
+# zstd PHP extension, linked against the system libzstd.
+RUN set -eux; \
+    git clone --depth=1 --branch "${ZSTD_EXT_VERSION}" \
+        https://github.com/kjdev/php-ext-zstd.git /tmp/zstd; \
+    cd /tmp/zstd; \
+    git rev-parse HEAD | grep -q "^${ZSTD_EXT_COMMIT}"; \
+    phpize; \
+    ./configure --with-libzstd; \
+    make -j"$(nproc)"; \
+    make install; \
+    docker-php-ext-enable zstd; \
+    cd /; rm -rf /tmp/zstd
+
+# phpredis with igbinary serializer + zstd compression compiled in.
 RUN set -eux; \
     git clone --depth=1 --branch "${PHPREDIS_VERSION}" \
         https://github.com/phpredis/phpredis.git /tmp/phpredis; \
@@ -90,7 +121,8 @@ FROM ${BASE_IMAGE}
 ARG WP_UID
 ARG WP_GID
 ARG WP_PORT
-ENV WP_PORT=${WP_PORT}
+ENV WP_PORT=${WP_PORT} \
+    WP_LISTEN=${WP_PORT}
 
 # Fail-closed guard: refuse to build on a PHP release vulnerable to
 # CVE-2026-109618 / CVE-2026-109619 (unauthenticated RCE, fixed 2026-10-21 in
@@ -207,7 +239,7 @@ RUN set -eux; \
     a2enmod headers rewrite; \
     a2dismod -f autoindex status; \
     a2enconf zz-hardening; \
-    sed -ri "s/^Listen 80\$/Listen ${WP_PORT}/" /etc/apache2/ports.conf; \
+    sed -ri 's/^Listen 80$/Listen ${WP_LISTEN}/' /etc/apache2/ports.conf; \
     sed -ri "s/<VirtualHost \*:80>/<VirtualHost *:${WP_PORT}>/" /etc/apache2/sites-available/000-default.conf; \
     mkdir -p /var/run/apache2 /var/lock/apache2 /var/log/apache2; \
     chown "${WP_UID}:${WP_GID}" /var/run/apache2 /var/lock/apache2 /var/log/apache2; \
