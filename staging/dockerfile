@@ -1,81 +1,271 @@
+# syntax=docker/dockerfile:1
+# WordPress + Redis (igbinary/zstd) — immutable core, hardened runtime image
+# ==========================================================================
+# Design:
+#   - Core (wp-admin, wp-includes, top-level *.php) is owned by root and
+#     read-only to the runtime user.
+#   - Runtime user is a non-root UID/GID set by build args (default 1300) to
+#     match your orchestrator's securityContext. Apache listens on an
+#     unprivileged port (default 8080) so no capabilities are needed.
+#   - wp-content is writable by the runtime user only (plugins/themes/uploads).
+#     PHP execution inside wp-content/uploads is denied.
+#   - No compilers or PECL/PEAR tooling in the final image; no setuid binaries.
+#   - Apache .htaccess is disabled (AllowOverride None); WordPress rewrite
+#     rules live in the server config, so nothing needs to write to the webroot.
+#
+# Runtime requirements:
+#   - Container port is 8080 (not 80). Update Service/targetPort/-p mappings.
+#   - Recommended securityContext: runAsNonRoot, allowPrivilegeEscalation=false,
+#     capabilities.drop=[ALL], seccompProfile=RuntimeDefault. The root FS can be
+#     read-only if you mount writable emptyDirs at /tmp, /var/run/apache2,
+#     /var/lock/apache2 and wp-content.
+#   - ENTRYPOINT bypasses the stock WordPress entrypoint (it needs a writable
+#     webroot). wp-config.php is baked in and driven by WORDPRESS_* env vars.
+#     Supply WORDPRESS_DB_* and, ideally, the WORDPRESS_*_KEY / *_SALT values.
+# ==========================================================================
+
+ARG WP_UID=1300
+ARG WP_GID=1300
+ARG WP_PORT=8080
+
+# Floating tag by default for local builds. CI should pin to a digest
+# (wordpress@sha256:...). Both stages MUST use the same base.
+ARG BASE_IMAGE=wordpress:php8.5-apache
+
 # ============================================================================
-# STAGE 1: build PHP extensions (unchanged from before, discarded after)
+# STAGE 1: build PHP extensions (discarded; nothing here ships)
 # ============================================================================
-FROM wordpress:php8.3-apache AS build
+FROM ${BASE_IMAGE} AS build
 
-RUN apt-get update && apt-get install -y \
-    libzip-dev \
-    zlib1g-dev \
-    libzstd-dev \
-    libzstd1 \
-    zstd \
-    git \
-    autoconf \
-    make \
-    && rm -rf /var/lib/apt/lists/*
+# Exact, reviewed versions (verified current as of 2026-10-21).
+# Bump deliberately; do not use floating "latest" for compiled code.
+ARG PHPREDIS_VERSION=6.3.0
+ARG PHPREDIS_COMMIT=df4fab2
+ARG IGBINARY_VERSION=3.2.16
+ARG ZSTD_EXT_VERSION=0.16.0
 
-RUN pecl install igbinary zstd \
-    && docker-php-ext-enable igbinary zstd
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        libzstd-dev \
+        pkg-config; \
+    rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth=1 https://github.com/phpredis/phpredis.git /tmp/phpredis \
-    && cd /tmp/phpredis \
-    && phpize \
-    && ./configure --enable-redis-zstd --enable-redis-igbinary \
-    && make -j$(nproc) \
-    && make install \
-    && docker-php-ext-enable redis \
-    && rm -rf /tmp/phpredis
+# igbinary + zstd from PECL at pinned versions (system libzstd requested).
+RUN set -eux; \
+    pecl install "igbinary-${IGBINARY_VERSION}"; \
+    pecl install -D 'with-libzstd="yes"' "zstd-${ZSTD_EXT_VERSION}"; \
+    docker-php-ext-enable igbinary zstd
+
+# phpredis built from a pinned tag (not the default branch), with the tag's
+# commit verified, so the build is reproducible and tamper-evident.
+RUN set -eux; \
+    git clone --depth=1 --branch "${PHPREDIS_VERSION}" \
+        https://github.com/phpredis/phpredis.git /tmp/phpredis; \
+    cd /tmp/phpredis; \
+    git rev-parse HEAD | grep -q "^${PHPREDIS_COMMIT}"; \
+    phpize; \
+    ./configure --enable-redis-zstd --enable-redis-igbinary; \
+    make -j"$(nproc)"; \
+    make install; \
+    docker-php-ext-enable redis; \
+    cd /; rm -rf /tmp/phpredis
+
+# Collect only what the runtime needs: three .so files and their ini stubs.
+RUN set -eux; \
+    ext_dir="$(php-config --extension-dir)"; \
+    mkdir -p /out; \
+    cp "${ext_dir}/igbinary.so" "${ext_dir}/redis.so" "${ext_dir}/zstd.so" /out/; \
+    cd /usr/local/etc/php/conf.d; \
+    cp docker-php-ext-igbinary.ini docker-php-ext-redis.ini docker-php-ext-zstd.ini /out/
 
 
 # ============================================================================
 # STAGE 2: final runtime image
 # ============================================================================
-FROM wordpress:php8.3-apache
+FROM ${BASE_IMAGE}
 
-COPY --from=build /usr/local/etc/php /usr/local/etc/php
-COPY --from=build /usr/local/lib/php /usr/local/lib/php
+ARG WP_UID
+ARG WP_GID
+ARG WP_PORT
+ENV WP_PORT=${WP_PORT}
 
-# Create UID/GID 1300 to match k3s's runAsUser/fsGroup: 1300.
-# --shell=/sbin/nologin: service account only, never an interactive login.
-RUN groupadd -g 1300 wpuser \
-    && useradd -u 1300 -g 1300 --home-dir=/nonexistent --shell=/sbin/nologin wpuser
+# Fail-closed guard: refuse to build on a PHP release vulnerable to
+# CVE-2026-109618 / CVE-2026-109619 (unauthenticated RCE, fixed 2026-10-21 in
+# 8.5.12, 8.4.27, 8.3.36, 8.2.35). Docker Hub's wordpress image can lag the
+# php image after a security release, so a floating tag may still be old.
+# Release candidates (e.g. 8.5.12RC1) sort below the final and are rejected.
+RUN php -r '$min=["8.2"=>"8.2.35","8.3"=>"8.3.36","8.4"=>"8.4.27","8.5"=>"8.5.12"]; $m=PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION; if(!isset($min[$m])||version_compare(PHP_VERSION,$min[$m],"<")){fwrite(STDERR,"Refusing to build: PHP ".PHP_VERSION." is unpatched or unsupported (need >= ".($min[$m]??"8.2.35+").")\n");exit(1);}echo "PHP ".PHP_VERSION." OK\n";'
 
-# Lay down WordPress core into the webroot.
-RUN cp -rp /usr/src/wordpress/. /var/www/html/
+LABEL org.opencontainers.image.description="WordPress (PHP 8.5, Apache) with Redis (igbinary/zstd), immutable core, non-root, hardened" \
+      org.opencontainers.image.source="https://github.com/phpredis/phpredis"
 
-# --- Immutable core ---
-# Own everything under webroot as root, dirs 755 / files 644. Any non-root
-# UID (including 1300) can read/execute but cannot write, rename, or delete.
-# This is the actual immutability mechanism — it's a filesystem permission,
-# not the USER directive.
-RUN chown -R root:root /var/www/html \
-    && find /var/www/html -type d -exec chmod 755 {} \; \
-    && find /var/www/html -type f -exec chmod 644 {} \;
+# --- 1. Patch OS, strip build toolchain and setuid/setgid bits -------------
+# The official php images keep the PHPIZE toolchain; it is not needed at
+# runtime and is exactly what an attacker wants after getting code exec.
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get -y --no-install-recommends upgrade; \
+    apt-get purge -y --auto-remove \
+        autoconf dpkg-dev g++ gcc libc6-dev make pkg-config re2c; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*; \
+    rm -f /usr/local/bin/pear /usr/local/bin/pecl /usr/local/bin/peardev; \
+    find / -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec chmod a-s {} + 2>/dev/null || true
 
-# --- wp-content is intentionally NOT chowned/chmodded here ---
-# Your k3s manifest mounts a PVC directly over /var/www/html/wp-content:
-#   volumeMounts:
-#   - mountPath: /var/www/html/wp-content
-#     name: wordpress-data
-# That PVC mount completely replaces this directory's contents at container
-# start — whatever ownership/permissions we set on it in the image are
-# irrelevant, since the NFS share (already owned by 1300 on the QNAP side)
-# is what actually gets mounted there. Setting permissions on it here would
-# be dead code that only matters in the hypothetical case someone runs this
-# image without the PVC mounted (e.g. local `docker run` testing) — if you
-# want that fallback case to also be writable by 1300, uncomment:
-#
-# RUN mkdir -p /var/www/html/wp-content \
-#     && chown -R 1300:1300 /var/www/html/wp-content \
-#     && find /var/www/html/wp-content -type d -exec chmod 775 {} \; \
-#     && find /var/www/html/wp-content -type f -exec chmod 664 {} \;
+# --- 2. Compiled extensions (only the artifacts, root-owned, 0644) ----------
+COPY --from=build /out/ /tmp/ext/
+RUN set -eux; \
+    install -o root -g root -m 0644 /tmp/ext/*.so "$(php-config --extension-dir)/"; \
+    install -o root -g root -m 0644 /tmp/ext/*.ini /usr/local/etc/php/conf.d/; \
+    rm -rf /tmp/ext; \
+    cp /usr/local/etc/php/php.ini-production /usr/local/etc/php/php.ini
 
-# Run as the same UID your k3s manifest enforces via runAsUser: 1300.
-# This also matters for local `docker run` testing so behavior matches
-# what the cluster will actually do.
-USER 1300
+# --- 3. Runtime user (service account, no shell, no home) ------------------
+RUN set -eux; \
+    groupadd -g "${WP_GID}" wpuser; \
+    useradd -u "${WP_UID}" -g "${WP_GID}" -M --home-dir=/nonexistent --shell=/usr/sbin/nologin wpuser
 
-HEALTHCHECK CMD curl --fail http://localhost || exit 1
+# --- 4. PHP hardening -------------------------------------------------------
+# disable_functions blocks process-spawning primitives. Plugins that shell out
+# (some backup, image-optimizer and import tools) will need entries removed.
+COPY --chmod=0644 <<'EOF' /usr/local/etc/php/conf.d/zz-hardening.ini
+expose_php = Off
+display_errors = Off
+display_startup_errors = Off
+log_errors = On
+allow_url_include = Off
+zend.exception_ignore_args = On
+zend.exception_string_param_max_len = 0
+session.use_strict_mode = 1
+session.use_only_cookies = 1
+session.cookie_httponly = 1
+session.cookie_samesite = Lax
+disable_functions = exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_alarm,dl
+EOF
+
+# --- 5. Apache hardening ----------------------------------------------------
+COPY --chmod=0644 <<'EOF' /etc/apache2/conf-available/zz-hardening.conf
+ServerName localhost
+ServerTokens Prod
+ServerSignature Off
+TraceEnable Off
+FileETag None
+Timeout 60
+KeepAliveTimeout 5
+RequestReadTimeout header=20-40,MinRate=500 body=20,MinRate=500
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    Header always unset X-Powered-By
+</IfModule>
+
+# .htaccess is never read; WordPress pretty-permalink rules live here instead.
+<Directory /var/www/html>
+    Options -Indexes -Includes -ExecCGI -MultiViews +FollowSymLinks
+    AllowOverride None
+    Require all granted
+
+    RewriteEngine On
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+    RewriteBase /
+    RewriteRule ^index\.php$ - [L]
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule . /index.php [L]
+</Directory>
+
+# Never serve dotfiles, config, or informational files.
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+<FilesMatch "^(wp-config\.php|wp-config-sample\.php|wp-config-docker\.php|readme\.html|license\.txt)$">
+    Require all denied
+</FilesMatch>
+
+# xmlrpc.php is a common brute-force/amplification target. Remove this block
+# only if you need Jetpack, the WordPress mobile app, or other XML-RPC clients.
+<Files "xmlrpc.php">
+    Require all denied
+</Files>
+
+# No PHP execution from user-writable upload paths.
+<Directory /var/www/html/wp-content/uploads>
+    <FilesMatch "\.(?i:php[0-9]?|phtml|pht|phar|phps)$">
+        Require all denied
+    </FilesMatch>
+</Directory>
+EOF
+
+RUN set -eux; \
+    a2enmod headers rewrite; \
+    a2dismod -f autoindex status; \
+    a2enconf zz-hardening; \
+    sed -ri "s/^Listen 80\$/Listen ${WP_PORT}/" /etc/apache2/ports.conf; \
+    sed -ri "s/<VirtualHost \*:80>/<VirtualHost *:${WP_PORT}>/" /etc/apache2/sites-available/000-default.conf; \
+    mkdir -p /var/run/apache2 /var/lock/apache2 /var/log/apache2; \
+    chown "${WP_UID}:${WP_GID}" /var/run/apache2 /var/lock/apache2 /var/log/apache2; \
+    chmod 0750 /var/run/apache2 /var/lock/apache2 /var/log/apache2
+
+# --- 6. WordPress core: immutable, root-owned -------------------------------
+# wp-config.php comes from the official env-var-driven template. The stock
+# entrypoint (which would generate it at start) is bypassed below, so it is
+# created here. Core self-update and in-dashboard code editing are disabled.
+RUN set -eux; \
+    rm -f /var/www/html/index.html; \
+    cp -a /usr/src/wordpress/. /var/www/html/; \
+    cd /var/www/html; \
+    cp wp-config-docker.php wp-config.php; \
+    printf '%s\n' \
+        "defined( 'DISALLOW_FILE_EDIT' ) || define( 'DISALLOW_FILE_EDIT', true );" \
+        "defined( 'WP_AUTO_UPDATE_CORE' ) || define( 'WP_AUTO_UPDATE_CORE', false );" \
+        > /tmp/wp-hardening.php; \
+    sed -i '/stop editing/e cat /tmp/wp-hardening.php' wp-config.php; \
+    rm -f /tmp/wp-hardening.php; \
+    grep -q DISALLOW_FILE_EDIT wp-config.php; \
+    rm -f readme.html license.txt wp-config-sample.php wp-config-docker.php; \
+    echo ok > healthz.txt; \
+    mkdir -p wp-content/uploads wp-content/upgrade; \
+    chown -R root:root /var/www/html; \
+    find /var/www/html -type d -exec chmod 755 {} +; \
+    find /var/www/html -type f -exec chmod 644 {} +; \
+    chown root:"${WP_GID}" wp-config.php; \
+    chmod 0640 wp-config.php; \
+    chown -R "${WP_UID}:${WP_GID}" wp-content; \
+    find wp-content -type d -exec chmod 755 {} +; \
+    find wp-content -type f -exec chmod 644 {} +
+
+# --- 7. Build-time smoke tests (fail the build, not production) -------------
+RUN set -eux; \
+    php -v; \
+    for m in igbinary redis zstd; do php -m | grep -qix "$m"; done; \
+    php --ri redis | grep -qi igbinary; \
+    php --ri redis | grep -qi zstd; \
+    php -l /var/www/html/wp-config.php; \
+    for f in "$(php-config --extension-dir)"/*.so; do \
+        if ldd "$f" | grep -q 'not found'; then ldd "$f"; exit 1; fi; \
+    done; \
+    apache2ctl -t; \
+    apache2ctl -M 2>/dev/null | grep -E 'headers_module|rewrite_module|php'; \
+    curl --version >/dev/null; \
+    if command -v gcc >/dev/null 2>&1; then echo "gcc still present"; exit 1; fi
+
+# Non-root for the rest of the build and at runtime (numeric on purpose, so
+# orchestrators can verify runAsNonRoot).
+USER ${WP_UID}
+
+EXPOSE ${WP_PORT}
+
+# Liveness of Apache only (static file). It deliberately does not depend on the
+# database, so a DB blip does not restart-loop the web tier.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl --fail --silent --max-time 4 -o /dev/null "http://127.0.0.1:${WP_PORT}/healthz.txt" || exit 1
 
 ENTRYPOINT ["docker-php-entrypoint"]
 CMD ["apache2-foreground"]
