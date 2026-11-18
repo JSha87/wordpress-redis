@@ -33,7 +33,7 @@ ARG WP_UID=1300
 ARG WP_GID=1300
 ARG WP_PORT=80
 
-# Floating tag by default for local builds. CI should pin to a digest
+# Floating tag by default for local builds. CI should pin to a digest. Now 7.1.5
 # (wordpress@sha256:...). Both stages MUST use the same base.
 ARG BASE_IMAGE=wordpress:php8.5-apache
 
